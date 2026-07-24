@@ -1,0 +1,8 @@
+Kenney Tiny Dungeon and Kenney Tiny Town
+
+License: Creative Commons CC0 1.0 Universal
+Source: https://kenney.nl/assets/tiny-dungeon
+Source: https://kenney.nl/assets/tiny-town
+
+These assets may be used for personal, educational, and commercial projects.
+Attribution is not required, but Kenney is credited in the game footer.
