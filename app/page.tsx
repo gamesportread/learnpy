@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { prepareNativePython, runNativePython, type NativePythonResult } from "./native-python";
 
 type Spell = "ice" | "wind" | "sound" | "metal" | "stone" | "fire" | "earth";
 type ObjectKind = "monster" | "tree" | "rock" | "mud" | "water";
@@ -529,8 +530,6 @@ const DIFFICULTIES: Difficulty[] = [
 const DEFAULT_DIFFICULTY: DifficultyId = "beginner";
 const difficultyById = (id: DifficultyId) => DIFFICULTIES.find((item) => item.id === id) ?? DIFFICULTIES[1];
 
-const EXECUTION_LIMIT_MS = 5;
-
 const STARTER_CODE: Record<number, string> = {
   1: "# 用 range(stop) 冰封这一排史莱姆\n",
   2: "# 用 range(start, stop) 追踪斜线上的蝙蝠\n",
@@ -1054,6 +1053,8 @@ function advanceTargetState(
   return true;
 }
 
+// Retained as a non-shipping migration fallback for older saved lessons.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function executeProgram(source: string, level: Level): Action[] {
   const nodes = parseProgram(source);
   const vars: Record<string, Value> = {};
@@ -1405,6 +1406,9 @@ function Battle({
         : `${selectedDifficulty.label} · 怪物不会移动`;
 
   useEffect(() => { objectsRef.current = objects; }, [objects]);
+  useEffect(() => {
+    void prepareNativePython().catch(() => undefined);
+  }, []);
 
   useEffect(() => {
     if (!planning || !hasMovingEnemies || selectedDifficulty.intervalMs === null) return;
@@ -1491,7 +1495,7 @@ function Battle({
     setExecutionMs(null);
     setSuccessfulRun(null);
     setStatus("idle");
-    setLog([`战场和法力已复原。代码运行上限为 ${EXECUTION_LIMIT_MS}ms。`]);
+    setLog(["战场和法力已复原。Python 运行时会直接执行合法语法，并按最终施法结果判定。"]);
   };
 
   const animateActions = async (
@@ -1499,6 +1503,7 @@ function Battle({
     runtimeObjects: GameObject[],
     measuredExecutionMs: number,
     replayResult?: Pick<SuccessfulRun, "score" | "stars">,
+    stdout = "",
   ) => {
     const activeRun = runId.current + 1;
     runId.current = activeRun;
@@ -1511,7 +1516,8 @@ function Battle({
     let localOrder = 0;
     let invalidHits = 0;
     let remainingMana = level.mana;
-    const messages = [replayResult ? `开始回放上次通关的 ${actions.length} 次法术。` : `已生成 ${actions.length} 次法术，开始按代码顺序释放。`];
+    const messages = [replayResult ? `开始回放上次通关的 ${actions.length} 次法术。` : `原生 Python 已生成 ${actions.length} 次法术，开始按代码顺序释放。`];
+    if (stdout.trim()) messages.push(`Python 输出：${stdout.trim().slice(0, 240)}`);
     // Freeze timed movement immediately, including the brief render window before
     // React tears down the planning interval. It stays frozen after a clear.
     completedRef.current = true;
@@ -1641,32 +1647,39 @@ function Battle({
 
   const runCode = async () => {
     const runtimeObjects = objectsRef.current;
-    let actions: Action[];
-    const executionStartedAt = performance.now();
+    const runtimeTargets = runtimeObjects
+      .filter((object) => object.target)
+      .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+      .map((object) => ({
+        row: object.row,
+        col: object.col,
+        order: object.order,
+        requiredSpells: object.requiredSpells,
+        layer: object.layer,
+        slot: object.slot,
+      }));
+    completedRef.current = true;
+    setStatus("running");
+    setStars(0);
+    setLog(["正在由浏览器中的原生 Python 解释器运行代码……"]);
+    let result: NativePythonResult;
     try {
-      actions = executeProgram(code, { ...level, objects: runtimeObjects });
+      result = await runNativePython(code, level.spell, runtimeTargets);
     } catch (error) {
-      setExecutionMs(performance.now() - executionStartedAt);
+      setExecutionMs(null);
       setStars(0);
       const advanceMessage = advanceEnemiesAfterFailure();
-      setLog([`语法法阵没有成形：${error instanceof Error ? error.message : "未知错误"}`, advanceMessage]);
+      setLog([`Python 没有成功运行：${error instanceof Error ? error.message : "未知错误"}`, advanceMessage]);
       return;
     }
-    const measuredExecutionMs = performance.now() - executionStartedAt;
-    setExecutionMs(measuredExecutionMs);
-    if (measuredExecutionMs > EXECUTION_LIMIT_MS) {
-      setScore(0);
-      setStars(0);
-      const advanceMessage = advanceEnemiesAfterFailure();
-      setLog([`运行耗时 ${measuredExecutionMs.toFixed(3)}ms，超过 ${EXECUTION_LIMIT_MS}ms 上限，施法失败。请精简循环。`, advanceMessage]);
-      return;
-    }
+    const actions = result.actions.map((action) => ({ ...action, spell: action.spell as Spell }));
+    setExecutionMs(result.executionMs);
     if (!actions.length) {
       const advanceMessage = advanceEnemiesAfterFailure();
       setLog(["代码运行了，但没有释放任何法术。", advanceMessage]);
       return;
     }
-    await animateActions(actions, runtimeObjects, measuredExecutionMs);
+    await animateActions(actions, runtimeObjects, result.executionMs, undefined, result.stdout);
   };
 
   const replay = async () => {
@@ -1751,7 +1764,7 @@ function Battle({
         <div className="spell-badge"><span>{level.availableSpells ? `${level.availableSpells.length}X` : level.spell.slice(0, 2).toUpperCase()}</span><div><small>本关法术</small><strong>{level.spellName}</strong><code>{(level.availableSpells ?? [level.spell]).map((spell) => `${spell}(i,j)`).join(" / ")}</code></div></div>
         <div className="mission-copy"><small>{movementRule}</small><p>{dynamicMission}</p></div>
         <div className="mission-metrics">
-          <div className={`runtime-budget ${executionMs !== null && executionMs > EXECUTION_LIMIT_MS ? "is-danger" : ""}`}><small>代码运行</small><strong>{executionMs === null ? "—" : executionMs.toFixed(2)}<em> / {EXECUTION_LIMIT_MS}ms</em></strong></div>
+          <div className="runtime-budget"><small>原生 Python</small><strong>{executionMs === null ? "—" : executionMs.toFixed(2)}<em> ms</em></strong></div>
           <div className="target-progress"><small>目标</small><strong>{removed.size}<em> / {orderedTargets.length}</em></strong><div><span style={{ width: `${(removed.size / orderedTargets.length) * 100}%` }} /></div></div>
         </div>
       </section>
@@ -1870,7 +1883,7 @@ function Battle({
             </div>
             {status === "success" && <button className="next-button" onClick={onBack}>收下 {stars} 颗星，返回世界地图 →</button>}
           </div>
-          <div className="safety-note"><span>盾</span> 本地安全模式：可使用 range、列表/元组、解包、索引、for、while、if 与常用序列函数；最终只按施法结果判定。</div>
+          <div className="safety-note"><span>盾</span> 浏览器原生 Python：支持函数、推导式及 itertools 等教学标准库；游戏只按最终法术坐标、顺序和结果判定。</div>
         </div>
       </section>
     </main>

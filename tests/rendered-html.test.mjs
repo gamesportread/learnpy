@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import vm from "node:vm";
-import ts from "typescript";
+import { loadPyodide } from "pyodide";
 
 async function render() {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
@@ -25,19 +24,22 @@ async function render() {
   );
 }
 
-async function loadSafePythonRuntime() {
-  const source = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
-  const start = source.indexOf("type Value =");
-  const end = source.indexOf("\nconst sleep =", start);
-  assert.ok(start >= 0 && end > start, "safe Python runtime source should be discoverable");
-  const runtimeSource = `${source.slice(start, end)}\n;globalThis.__runtime = { executeProgram };`;
-  const javascript = ts.transpileModule(runtimeSource, {
-    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
-  }).outputText;
-  const context = {};
-  vm.createContext(context);
-  vm.runInContext(javascript, context);
-  return context.__runtime;
+let pyodidePromise;
+let harnessPromise;
+
+async function runNativePython(source, defaultSpell = "fire", targets = []) {
+  pyodidePromise ??= loadPyodide();
+  harnessPromise ??= readFile(new URL("../public/python-harness.py", import.meta.url), "utf8");
+  const [pyodide, harness] = await Promise.all([pyodidePromise, harnessPromise]);
+  const globals = pyodide.globals.get("dict")();
+  try {
+    globals.set("__source", source);
+    globals.set("__targets_json", JSON.stringify(targets));
+    globals.set("__default_spell", defaultSpell);
+    return JSON.parse(await pyodide.runPythonAsync(harness, { globals }));
+  } finally {
+    globals.destroy();
+  }
 }
 
 test("server-renders twelve levels and the embedded five-mode challenge dossier", async () => {
@@ -88,7 +90,10 @@ test("per-level difficulty records, marks, and map placement stay wired together
 });
 
 test("levels eleven and twelve use a random boulder and one-spell outward spiral", async () => {
-  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const [page, harness] = await Promise.all([
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../public/python-harness.py", import.meta.url), "utf8"),
+  ]);
   const level12Start = page.indexOf("id: 12,");
   const level12End = page.indexOf("\n  },\n];", level12Start);
   const level12 = page.slice(level12Start, level12End);
@@ -104,12 +109,11 @@ test("levels eleven and twelve use a random boulder and one-spell outward spiral
   assert.doesNotMatch(level12, /availableSpells|requiredSpells/);
   assert.match(page, /function boulderTargets\(randomize = false\)/);
   assert.match(page, /function outwardSpiralCoords\(/);
-  assert.match(page, /name === "rock_top"/);
-  assert.match(page, /name === "rock_left" \|\| name === "rock_right"/);
-  assert.match(page, /name === "rock_has"/);
   assert.match(page, /for layer in range\(1, 5\):/);
-  assert.match(page, /function advanceTargetState\(/);
-  assert.doesNotMatch(page, /path_is_clear|blockage_remains|boss_needs_ice/);
+  assert.match(harness, /def rock_top\(\):/);
+  assert.match(harness, /def rock_left\(row\):/);
+  assert.match(harness, /def rock_has\(row, col\):/);
+  assert.doesNotMatch(harness, /path_is_clear|blockage_remains|boss_needs_ice/);
 });
 
 test("battle UI has external axes, caster-origin traces, fixed 2x timing, and replay", async () => {
@@ -138,16 +142,15 @@ test("battle UI has external axes, caster-origin traces, fixed 2x timing, and re
   assert.doesNotMatch(css, /\.speed-control\s*\{|\.arena-status\s*\{/);
 });
 
-test("safe Python accepts tuple iteration and unpacking without requiring range as the outer loop", async () => {
-  const { executeProgram } = await loadSafePythonRuntime();
+test("native Python accepts tuple iteration and unpacking without requiring range as the outer loop", async () => {
   const source = [
     "for sx, sy in (13,2),(11,4),(9,6):",
     "    for dx in range(0,3):",
     "        earth(sx-dx, sy)",
   ].join("\n");
-  const actions = executeProgram(source, { spell: "earth", objects: [] });
+  const { actions } = await runNativePython(source, "earth");
 
-  assert.deepEqual(JSON.parse(JSON.stringify(actions)), [
+  assert.deepEqual(actions, [
     { spell: "earth", row: 13, col: 2, line: 3 },
     { spell: "earth", row: 12, col: 2, line: 3 },
     { spell: "earth", row: 11, col: 2, line: 3 },
@@ -160,21 +163,19 @@ test("safe Python accepts tuple iteration and unpacking without requiring range 
   ]);
 });
 
-test("safe Python also supports lists, indexing, enumerate, zip, and unpack assignment", async () => {
-  const { executeProgram } = await loadSafePythonRuntime();
+test("native Python executes imports, itertools.product, functions, and comprehensions", async () => {
   const source = [
-    "points = [(4, 2), (3, 3)]",
-    "for index, point in enumerate(points):",
-    "    row, col = point",
-    "    earth(row + index, point[1])",
-    "for row, col in zip([2], [5]):",
-    "    earth(row, col)",
+    "from itertools import *",
+    "def cast(rows, cols):",
+    "    points = [(i, j) for i, j in product(rows, cols)]",
+    "    for i, j in points:",
+    "        fire(i, j)",
+    "cast(range(5, 10), range(3, 8))",
   ].join("\n");
-  const actions = executeProgram(source, { spell: "earth", objects: [] });
+  const { actions, executionMs } = await runNativePython(source);
 
-  assert.deepEqual(JSON.parse(JSON.stringify(actions)), [
-    { spell: "earth", row: 4, col: 2, line: 4 },
-    { spell: "earth", row: 4, col: 3, line: 4 },
-    { spell: "earth", row: 2, col: 5, line: 6 },
-  ]);
+  assert.equal(actions.length, 25);
+  assert.deepEqual(actions[0], { spell: "fire", row: 5, col: 3, line: 5 });
+  assert.deepEqual(actions.at(-1), { spell: "fire", row: 9, col: 7, line: 5 });
+  assert.ok(executionMs >= 0);
 });
