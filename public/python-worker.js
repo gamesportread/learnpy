@@ -1,9 +1,13 @@
 import { loadPyodide } from "/pyodide/pyodide.mjs";
 
-const [pyodide, harness] = await Promise.all([
+const [pyodide, harness, simulationHarness] = await Promise.all([
   loadPyodide({ indexURL: "/pyodide/" }),
   fetch("/python-harness.py").then((response) => {
     if (!response.ok) throw new Error("无法加载 Python 游戏桥接代码");
+    return response.text();
+  }),
+  fetch("/python-simulation-harness.py").then((response) => {
+    if (!response.ok) throw new Error("无法加载 Python 模拟战场桥接代码");
     return response.text();
   }),
 ]);
@@ -16,9 +20,17 @@ self.addEventListener("message", async (event) => {
   const globals = pyodide.globals.get("dict")();
   try {
     globals.set("__source", message.source);
-    globals.set("__targets_json", JSON.stringify(message.targets));
-    globals.set("__default_spell", message.defaultSpell);
-    const resultJson = await pyodide.runPythonAsync(harness, { globals });
+    const simulation = message.mode === "simulation";
+    if (simulation) {
+      globals.set("__scenario_json", JSON.stringify(message.scenario));
+    } else {
+      globals.set("__targets_json", JSON.stringify(message.targets));
+      globals.set("__default_spell", message.defaultSpell);
+    }
+    const resultJson = await pyodide.runPythonAsync(
+      simulation ? simulationHarness : harness,
+      { globals },
+    );
     const result = JSON.parse(resultJson);
     self.postMessage({ type: "result", id: message.id, result });
   } catch (error) {

@@ -26,6 +26,7 @@ async function render() {
 
 let pyodidePromise;
 let harnessPromise;
+let simulationHarnessPromise;
 
 async function runNativePython(source, defaultSpell = "fire", targets = []) {
   pyodidePromise ??= loadPyodide();
@@ -36,6 +37,20 @@ async function runNativePython(source, defaultSpell = "fire", targets = []) {
     globals.set("__source", source);
     globals.set("__targets_json", JSON.stringify(targets));
     globals.set("__default_spell", defaultSpell);
+    return JSON.parse(await pyodide.runPythonAsync(harness, { globals }));
+  } finally {
+    globals.destroy();
+  }
+}
+
+async function runNativeSimulation(source, scenario) {
+  pyodidePromise ??= loadPyodide();
+  simulationHarnessPromise ??= readFile(new URL("../public/python-simulation-harness.py", import.meta.url), "utf8");
+  const [pyodide, harness] = await Promise.all([pyodidePromise, simulationHarnessPromise]);
+  const globals = pyodide.globals.get("dict")();
+  try {
+    globals.set("__source", source);
+    globals.set("__scenario_json", JSON.stringify(scenario));
     return JSON.parse(await pyodide.runPythonAsync(harness, { globals }));
   } finally {
     globals.destroy();
@@ -58,7 +73,7 @@ test("server-renders twelve levels and the embedded five-mode challenge dossier"
   assert.match(html, /中级/);
   assert.match(html, /大魔法师/);
   assert.match(html, /地狱模式/);
-  assert.match(html, /冰火石巨人/);
+  assert.match(html, /冰火棋盘巨像/);
   assert.match(html, /寒冰迷螺/);
   assert.match(html, /峡口巨岩/);
   assert.match(html, /逆旋星核/);
@@ -89,7 +104,7 @@ test("per-level difficulty records, marks, and map placement stay wired together
   assert.doesNotMatch(css, /\.difficulty-card\s*\{/);
 });
 
-test("levels eleven and twelve use a random boulder and one-spell outward spiral", async () => {
+test("advanced levels use teachable Python without undisclosed game helpers", async () => {
   const [page, harness] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../public/python-harness.py", import.meta.url), "utf8"),
@@ -98,7 +113,7 @@ test("levels eleven and twelve use a random boulder and one-spell outward spiral
   const level12End = page.indexOf("\n  },\n];", level12Start);
   const level12 = page.slice(level12Start, level12End);
 
-  assert.match(page, /id: 9,[\s\S]*title: "冰火石巨人"[\s\S]*availableSpells: \["ice", "fire"\][\s\S]*strictOrder: true/);
+  assert.match(page, /id: 9,[\s\S]*title: "冰火棋盘巨像"[\s\S]*availableSpells: \["ice", "fire"\][\s\S]*mana: 25[\s\S]*strictOrder: true/);
   assert.match(page, /id: 10,[\s\S]*title: "寒冰迷螺"[\s\S]*mana: 49[\s\S]*strictOrder: true/);
   assert.match(page, /id: 11,[\s\S]*title: "峡口巨岩"[\s\S]*mana: 27[\s\S]*objects: boulderTargets\(\)[\s\S]*stationary: true/);
   assert.match(level12, /title: "逆旋星核"/);
@@ -110,10 +125,10 @@ test("levels eleven and twelve use a random boulder and one-spell outward spiral
   assert.match(page, /function boulderTargets\(randomize = false\)/);
   assert.match(page, /function outwardSpiralCoords\(/);
   assert.match(page, /for layer in range\(1, 5\):/);
-  assert.match(harness, /def rock_top\(\):/);
-  assert.match(harness, /def rock_left\(row\):/);
-  assert.match(harness, /def rock_has\(row, col\):/);
-  assert.doesNotMatch(harness, /path_is_clear|blockage_remains|boss_needs_ice/);
+  assert.match(page, /if \(i \+ j\) % 2 == \$\{iceParity\}:/);
+  assert.match(page, /for i, left, right in \[\$\{spans\}\]:/);
+  assert.doesNotMatch(page, /village_has_water|water_front|zigzag_col|golem_layers|shell_size|golem_row|golem_col|rock_top|rock_bottom|rock_left|rock_right|rock_has/);
+  assert.doesNotMatch(harness, /village_has_water|water_front|zigzag_col|golem_layers|shell_size|golem_row|golem_col|rock_top|rock_bottom|rock_left|rock_right|rock_has/);
 });
 
 test("battle UI has external axes, caster-origin traces, fixed 2x timing, and replay", async () => {
@@ -163,6 +178,23 @@ test("native Python accepts tuple iteration and unpacking without requiring rang
   ]);
 });
 
+test("simplified level nine pattern needs only nested loops and an if/else", async () => {
+  const source = [
+    "for i in range(4, 9):",
+    "    for j in range(4, 9):",
+    "        if (i + j) % 2 == 0:",
+    "            ice(i, j)",
+    "        else:",
+    "            fire(i, j)",
+  ].join("\n");
+  const { actions } = await runNativePython(source, "ice");
+
+  assert.equal(actions.length, 25);
+  assert.deepEqual(actions[0], { spell: "ice", row: 4, col: 4, line: 4 });
+  assert.deepEqual(actions[1], { spell: "fire", row: 4, col: 5, line: 6 });
+  assert.deepEqual(actions.at(-1), { spell: "ice", row: 8, col: 8, line: 4 });
+});
+
 test("native Python executes imports, itertools.product, functions, and comprehensions", async () => {
   const source = [
     "from itertools import *",
@@ -178,4 +210,81 @@ test("native Python executes imports, itertools.product, functions, and comprehe
   assert.deepEqual(actions[0], { spell: "fire", row: 5, col: 3, line: 5 });
   assert.deepEqual(actions.at(-1), { spell: "fire", row: 9, col: 7, line: 5 });
   assert.ok(executionMs >= 0);
+});
+
+test("chapter two adds a persistent team map and a one-warrior simulation API", async () => {
+  const [page, campaign, simulation, worker, css] = await Promise.all([
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/team-campaign.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/team-simulation.ts", import.meta.url), "utf8"),
+    readFile(new URL("../public/python-worker.js", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(page, /第二章新地图/);
+  assert.match(page, /组建战队 · 实时模拟/);
+  assert.match(page, /<TeamCampaign onBack=/);
+  assert.match(campaign, /守望者前线/);
+  assert.match(campaign, /24 × 14 · 同一张持续地图/);
+  assert.match(campaign, /曼哈顿距离 ≤ 1 时自动攻击/);
+  assert.match(campaign, /怪物每秒向左移动 1 格/);
+  assert.match(simulation, /maxTicks: 24/);
+  assert.match(simulation, /warrior: \{ id: 101, row: 6, col: 5 \}/);
+  assert.match(simulation, /while battle_running\(\):/);
+  assert.match(simulation, /for enemy in enemies:/);
+  assert.match(worker, /message\.mode === "simulation"/);
+  assert.match(css, /\.sim-grid\s*\{[\s\S]*grid-template-columns:\s*repeat\(24/);
+});
+
+test("simulation Python advances every monster exactly once per step and the reference controller wins", async () => {
+  const scenario = {
+    rows: 14,
+    cols: 24,
+    maxTicks: 24,
+    killGoal: 5,
+    baseCol: 1,
+    warrior: { id: 101, row: 6, col: 5 },
+    initialMonsters: [
+      { id: 1, row: 6, col: 12 },
+      { id: 2, row: 6, col: 18 },
+    ],
+    spawns: [
+      { tick: 4, id: 3, row: 6, col: 23 },
+      { tick: 8, id: 4, row: 6, col: 16 },
+      { tick: 12, id: 5, row: 6, col: 23 },
+      { tick: 16, id: 6, row: 6, col: 15 },
+      { tick: 20, id: 7, row: 6, col: 23 },
+    ],
+  };
+  const source = [
+    "while battle_running():",
+    "    me = warrior()",
+    "    enemies = monsters()",
+    "    if len(enemies) == 0:",
+    "        step('WAIT')",
+    "        continue",
+    "    target = enemies[0]",
+    "    for enemy in enemies:",
+    "        if enemy['col'] < target['col']:",
+    "            target = enemy",
+    "    if target['row'] < me['row']:",
+    "        step('UP')",
+    "    elif target['row'] > me['row']:",
+    "        step('DOWN')",
+    "    elif target['col'] < me['col']:",
+    "        step('LEFT')",
+    "    elif target['col'] > me['col']:",
+    "        step('RIGHT')",
+    "    else:",
+    "        step('WAIT')",
+  ].join("\n");
+  const result = await runNativeSimulation(source, scenario);
+
+  assert.equal(result.outcome, "won");
+  assert.equal(result.frames.length, 25);
+  assert.deepEqual(result.frames.map((frame) => frame.tick), Array.from({ length: 25 }, (_, tick) => tick));
+  assert.equal(result.frames[0].monsters.find((monster) => monster.id === 2).col, 18);
+  assert.equal(result.frames[1].monsters.find((monster) => monster.id === 2).col, 17);
+  assert.ok(result.frames.at(-1).kills >= scenario.killGoal);
+  assert.match(result.frames.at(-1).events.join(" "), /先锋试炼完成/);
 });

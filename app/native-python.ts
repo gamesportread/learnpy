@@ -20,13 +20,49 @@ export type NativePythonResult = {
   executionMs: number;
 };
 
+export type SimulationUnit = {
+  id: number;
+  row: number;
+  col: number;
+};
+
+export type SimulationFrame = {
+  tick: number;
+  warrior: SimulationUnit;
+  monsters: SimulationUnit[];
+  kills: number;
+  direction: string;
+  events: string[];
+  outcome: "running" | "won" | "lost" | "incomplete";
+};
+
+export type SimulationScenario = {
+  rows: number;
+  cols: number;
+  maxTicks: number;
+  killGoal: number;
+  baseCol: number;
+  warrior: SimulationUnit;
+  initialMonsters: SimulationUnit[];
+  spawns: Array<SimulationUnit & { tick: number }>;
+};
+
+export type NativeSimulationResult = {
+  frames: SimulationFrame[];
+  outcome: "won" | "lost" | "incomplete";
+  stdout: string;
+  executionMs: number;
+};
+
+type NativeWorkerResult = NativePythonResult | NativeSimulationResult;
+
 type WorkerReply =
   | { type: "ready" }
-  | { type: "result"; id: number; result: NativePythonResult }
+  | { type: "result"; id: number; result: NativeWorkerResult }
   | { type: "error"; id: number; error: string };
 
 type PendingRequest = {
-  resolve: (result: NativePythonResult) => void;
+  resolve: (result: NativeWorkerResult) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 };
@@ -114,7 +150,7 @@ export async function runNativePython(
 
   const id = nextRequestId;
   nextRequestId += 1;
-  return new Promise<NativePythonResult>((resolve, reject) => {
+  return new Promise<NativeWorkerResult>((resolve, reject) => {
     const timer = setTimeout(() => {
       const error = new Error("代码运行超过 2 秒，可能存在无法结束的循环");
       pending.delete(id);
@@ -122,6 +158,27 @@ export async function runNativePython(
       disposeWorker(error);
     }, EXECUTION_TIMEOUT_MS);
     pending.set(id, { resolve, reject, timer });
-    worker!.postMessage({ type: "run", id, source, defaultSpell, targets });
-  });
+    worker!.postMessage({ type: "run", mode: "spell", id, source, defaultSpell, targets });
+  }) as Promise<NativePythonResult>;
+}
+
+export async function runNativeSimulation(
+  source: string,
+  scenario: SimulationScenario,
+): Promise<NativeSimulationResult> {
+  await ensureWorker();
+  if (!worker) throw new Error("Python 运行时没有启动");
+
+  const id = nextRequestId;
+  nextRequestId += 1;
+  return new Promise<NativeWorkerResult>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const error = new Error("控制程序运行超过 2 秒；请检查 while 是否在每轮调用了 step()");
+      pending.delete(id);
+      reject(error);
+      disposeWorker(error);
+    }, EXECUTION_TIMEOUT_MS);
+    pending.set(id, { resolve, reject, timer });
+    worker!.postMessage({ type: "run", mode: "simulation", id, source, scenario });
+  }) as Promise<NativeSimulationResult>;
 }
